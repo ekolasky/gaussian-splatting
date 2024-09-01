@@ -320,6 +320,10 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
+                # print(stored_state['exp_avg'].shape)
+                # print(mask.shape)
+                if stored_state["exp_avg"].shape[0] != mask.shape[0]:
+                    raise ValueError(f"The mask cannot index stored_state due to shape mismatch. Stored state has shape {stored_state['exp_avg'].shape[0]}. XYZ gradients has shape {mask.shape[0]}.")
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
                 stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
 
@@ -343,6 +347,9 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+
+        if valid_points_mask.shape[0] != self.xyz_gradient_accum.shape[0]:
+            raise ValueError(f"The valid_points_mask cannot index xyz_gradient_accum due to shape mismatch. Valid points has shape {valid_points_mask.shape[0]}. XYZ gradients has shape {self.xyz_gradient_accum.shape[0]}.")
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -391,14 +398,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
-        n_init_points = self.get_xyz.shape[0]
-        # Extract points that satisfy the gradient condition
-        padded_grad = torch.zeros((n_init_points), device="cuda")
-        padded_grad[:grads.shape[0]] = grads.squeeze()
-        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+    def densify_and_split(self, selected_pts_mask, N=2):
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -416,11 +416,7 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
-        # Extract points that satisfy the gradient condition
-        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+    def densify_and_clone(self, selected_pts_mask):
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -431,19 +427,87 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, max_num_points, pruning_ratio):
+        """
+        Modified densification and pruning to limit the number of points in the model
+        while still respecting the max_grad threshold.
+        """
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        # Create a mask for points above the max_grad threshold
+        grad_mask = grads.squeeze() > max_grad
 
+        # Calculate how many points we can add
+        num_points = self.get_xyz.shape[0]
+        if num_points > max_num_points:
+            if num_points - max_num_points < 1000:
+                allowed_num_points = max_num_points
+            else:
+                allowed_num_points = ((num_points - max_num_points) * pruning_ratio) + max_num_points
+        else:
+            allowed_num_points = max_num_points
+
+        # If model is allowed to add points then densify
+        if allowed_num_points > num_points:
+            # Select top n points from those above the threshold
+            above_threshold = grads[grad_mask]
+            if above_threshold.shape[0] > (allowed_num_points - num_points):
+                _, top_indices = above_threshold.topk(allowed_num_points - num_points, dim=0)
+                selected_pts_mask = torch.zeros_like(grad_mask)
+                selected_pts_mask[grad_mask.nonzero().squeeze()[top_indices]] = True
+            else:
+                selected_pts_mask = grad_mask
+
+            # Splits selected points into groups larger than percent_dense * extent and smaller than percent_dense * extent.
+            clone_mask = torch.logical_and(self.get_scaling.max(dim=1).values > self.percent_dense * extent, selected_pts_mask)
+            split_mask = torch.logical_and(self.get_scaling.max(dim=1).values <= self.percent_dense * extent, selected_pts_mask)
+            
+            num_clone = clone_mask.sum().item()
+            num_split = split_mask.sum().item()
+            
+            self.densify_and_clone(clone_mask)
+
+            split_mask = torch.cat([split_mask, torch.full((num_clone,), False, dtype=bool, device=split_mask.device)])
+            self.densify_and_split(split_mask)
+
+        # Prune points that are too large or have too low of an opacity
         prune_mask = (self.get_opacity < min_opacity).squeeze()
+        num_pruned_opacity = prune_mask.sum().item()
+
         if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
+            # big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+            # prune_mask_vs = torch.logical_or(prune_mask, big_points_vs)
+            prune_mask = torch.logical_or(prune_mask, big_points_ws)
+            # num_pruned_vs = big_points_vs.sum().item()
+            num_pruned_ws = big_points_ws.sum().item()
+        else:
+            num_pruned_ws = 0
+
+        if num_pruned_opacity > 0 or num_pruned_ws > 0:
+            print(f"Pruning {num_pruned_opacity} points due to low opacity, and {num_pruned_ws} points due to size in world space.")
+
         self.prune_points(prune_mask)
+
+        # If you still need to remove more points
+        num_points_to_prune = self.get_xyz.shape[0] - allowed_num_points
+        
+        if num_points_to_prune > 0:
+
+            # Calculate point importance based on gradients and opacity
+            importance = grads.squeeze()
+            
+            # Sort points by importance (lowest first)
+            _, indices = importance.sort()
+            
+            # Create a mask for points to keep (inverse of prune mask)
+            keep_mask = torch.ones(self.get_xyz.shape[0], dtype=bool, device=self.get_xyz.device)
+            num_points_to_prune = int(num_points_to_prune)
+            keep_mask[indices[:num_points_to_prune]] = False
+            
+            # Prune the least important points
+            self.prune_points(~keep_mask)            
 
         torch.cuda.empty_cache()
 
