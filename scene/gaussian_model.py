@@ -320,8 +320,7 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
-                # print(stored_state['exp_avg'].shape)
-                # print(mask.shape)
+
                 if stored_state["exp_avg"].shape[0] != mask.shape[0]:
                     raise ValueError(f"The mask cannot index stored_state due to shape mismatch. Stored state has shape {stored_state['exp_avg'].shape[0]}. XYZ gradients has shape {mask.shape[0]}.")
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -500,6 +499,9 @@ class GaussianModel:
             
             # Sort points by importance (lowest first)
             _, indices = importance.sort()
+
+            # Remove any indices larger than the size of xyz
+            indices = indices[indices < self.get_xyz.shape[0]]
             
             # Create a mask for points to keep (inverse of prune mask)
             keep_mask = torch.ones(self.get_xyz.shape[0], dtype=bool, device=self.get_xyz.device)
@@ -507,7 +509,7 @@ class GaussianModel:
             keep_mask[indices[:num_points_to_prune]] = False
             
             # Prune the least important points
-            self.prune_points(~keep_mask)            
+            self.prune_points(~keep_mask)
 
         torch.cuda.empty_cache()
 
